@@ -1,6 +1,6 @@
-冗余头文件扫描与解析工具链 (JetBrains 版)
+# 冗余头文件扫描与解析工具链 (JetBrains 版)
 
-简介
+## 简介
 
 本工具链主要用于 C++ 项目的架构瘦身与编译加速。它基于 **JetBrains ReSharper Command Line Tools (CLT)** 进行深度静态代码分析，定位项目中包含但未使用的冗余头文件 (`#include`)，并通过专门的 Python 脚本将其 XML 报告转换为结构化的 CSV 物理文件清单，以便无缝对接后续的自动化编译验证（`batch_rebuild.py` 等）。
 
@@ -8,7 +8,7 @@
 
 ------
 
-**阶段一：使用 JetBrains InspectCode 生成报告**
+## **阶段一：使用 JetBrains InspectCode 生成报告**
 
 1. 工具准备
 
@@ -38,7 +38,7 @@ inspectcode.exe "D:\ZW3D\zw3d_productional_architecture\out\build\0_MSBuild\ZW3D
 
 ------
 
-阶段二：使用 `xml_to_csv.py` 提取与解析
+## 阶段二：使用 `xml_to_csv.py` 提取与解析
 
 1. 脚本定位
 
