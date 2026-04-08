@@ -2,7 +2,7 @@
 
 ## 简介
 
-本工具链主要用于 C++ 项目的架构瘦身与编译加速。它基于 **JetBrains ReSharper Command Line Tools (CLT)** 进行深度静态代码分析，定位项目中包含但未使用的冗余头文件 (`#include`)，并通过专门的 Python 脚本将其 XML 报告转换为结构化的 CSV 物理文件清单，以便无缝对接后续的自动化编译验证（`batch_rebuild.py` 等）。
+本工具链主要用于 C++ 项目的架构瘦身与编译加速。它基于 **JetBrains ReSharper Command Line Tools (CLT)** 进行深度静态代码分析，定位项目中包含但未使用的冗余头文件 (`#include`)，并通过专门的 Python 脚本将其 SARIF 报告（JSON 格式）转换为结构化的 CSV 物理文件清单，以便无缝对接后续的自动化编译验证（`batch_rebuild.py` 等）。
 
 本方案具有**不依赖正则表达式**、**精准度极高**、**原生支持复杂 C++ 宏与模板解析**的特点。
 
@@ -28,36 +28,36 @@
 
 3. 执行扫描命令
 
-在终端中调用 `inspectcode.exe` 对解决方案进行扫描，并将结果输出为 XML 文件：
+在终端中调用 `inspectcode.exe` 对解决方案进行扫描，并将结果输出为 SARIF 文件：
 
 ```
-inspectcode.exe "D:\ZW3D\zw3d_productional_architecture\out\build\0_MSBuild\ZW3D.sln" --profile="你的配置文件.DotSettings" --output="report.xml"
+inspectcode.exe "D:\ZW3D\zw3d_productional_architecture\out\build\0_MSBuild\ZW3D.sln" --profile="你的配置文件.DotSettings" --output="report.sarif.json"
 ```
 
 *(注：由于项目庞大，此步骤可能需要较长时间，建议在夜间或使用高性能机器运行。)*
 
 ------
 
-## 阶段二：使用 `xml_to_csv.py` 提取与解析
+## 阶段二：使用 `sarif_to_csv.py` 提取与解析
 
 1. 脚本定位
 
-JetBrains 生成的 `report.xml` 包含了数百种不同类型的代码规范检查结果，且路径通常为相对路径。`xml_to_csv.py` 利用原生 XML DOM 树进行结构化解析，精准剥离出冗余头文件记录，并结合本地物理文件提取具体代码行。
+JetBrains 生成的 `report.sarif.json` 包含了数百种不同类型的代码规范检查结果，且路径通常为相对路径。`sarif_to_csv.py` 会读取其中的 SARIF `runs/results` 数据结构，精准剥离出冗余头文件记录，并结合本地物理文件提取具体代码行。
 
 2. 参数说明
 
 | **参数**         | **必填** | **说明**                                                     | **示例**                                      |
 | ---------------- | -------- | ------------------------------------------------------------ | --------------------------------------------- |
-| `-i`, `--input`  | ✅        | JetBrains 生成的 XML 报告文件路径。                          | `-i report.xml`                               |
+| `-i`, `--input`  | ✅        | JetBrains 生成的 SARIF 报告文件路径（JSON 格式）。           | `-i report.sarif.json`                        |
 | `-o`, `--output` | ❌        | 解析后生成的 CSV 保存路径（默认：`output.csv`）。            | `-o clean_headers.csv`                        |
-| `-p`, `--prefix` | ✅        | **极度重要！** 本地源码的根目录绝对路径。用于与 XML 中的相对路径拼接，从而让脚本能够打开真实的 `.cpp` 文件提取代码行。 | `-p "D:\ZW3D\zw3d_productional_architecture"` |
+| `-p`, `--prefix` | ✅        | **极度重要！** 本地源码的根目录绝对路径。用于与 SARIF 中的相对路径拼接，从而让脚本能够打开真实的 `.cpp` 文件提取代码行。 | `-p "D:\ZW3D\zw3d_productional_architecture"` |
 
 3. 执行解析
 
 打开终端，运行以下命令（请根据实际路径替换）： 
 
 ```
-python xml_to_csv.py -i report.xml -o output.csv -p "D:\ZW3D\zw3d_productional_architecture"
+python sarif_to_csv.py -i report.sarif.json -o output.csv -p "D:\ZW3D\zw3d_productional_architecture"
 ```
 
 4. 产出物 (`output.csv`)

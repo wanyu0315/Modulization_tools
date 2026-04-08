@@ -1,19 +1,18 @@
-import xml.etree.ElementTree as ET
+import json
 import csv
 import argparse
 import os
 
-def process_xml_report_to_csv(xml_file, output_csv_path, prefix_path):
+def process_sarif_report_to_csv(sarif_file, output_csv_path, prefix_path):
     error_data = []
     prefix_path = os.path.normpath(prefix_path)
-    print(f"正在解析 JetBrains XML 报告: {xml_file}")
+    print(f"正在解析 JetBrains SARIF 报告: {sarif_file}")
     
     try:
-        # 使用 XML 解析器加载文件
-        tree = ET.parse(xml_file)
-        root = tree.getroot()
-    except ET.ParseError as e:
-        print(f"❌ 读取 XML 文件失败，请检查文件格式是否完好: {e}")
+        with open(sarif_file, 'r', encoding='utf-8') as file:
+            sarif_data = json.load(file)
+    except json.JSONDecodeError as e:
+        print(f"❌ 读取 SARIF JSON 文件失败，请检查文件格式是否完好: {e}")
         return
     except Exception as e:
         print(f"❌ 发生未知错误: {e}")
@@ -21,27 +20,34 @@ def process_xml_report_to_csv(xml_file, output_csv_path, prefix_path):
 
     count = 0
 
-    # JetBrains 的报告通常把具体问题放在 <Issues> -> <Project> -> <Issue> 结构下
-    # 这里我们使用 XPath '//Issue' 直接查找整篇文档中所有的 Issue 节点
-    for issue in root.findall('.//Issue'):
-        type_id = issue.get('TypeId')
-        
-        # 匹配冗余头文件的错误类型 (通常是 CppUnusedIncludeDirective)
-        if type_id == 'CppUnusedIncludeDirective':
-            # 提取文件路径和行号
-            file_rel_path = issue.get('File')
-            line_str = issue.get('Line')
-            
-            if not file_rel_path or not line_str:
+    # JetBrains 的 SARIF 报告通常将问题放在 runs[*].results[*] 下
+    for run in sarif_data.get('runs', []):
+        for issue in run.get('results', []):
+            rule_id = issue.get('ruleId')
+
+            # 匹配冗余头文件的错误类型 (通常是 CppUnusedIncludeDirective)
+            if rule_id != 'CppUnusedIncludeDirective':
                 continue
-                
-            line_number = int(line_str)
-            
+
+            locations = issue.get('locations', [])
+            if not locations:
+                continue
+
+            physical_location = locations[0].get('physicalLocation', {})
+            artifact_location = physical_location.get('artifactLocation', {})
+            region = physical_location.get('region', {})
+
+            file_rel_path = artifact_location.get('uri')
+            line_number = region.get('startLine')
+
+            if not file_rel_path or not line_number:
+                continue
+
             # 1. 提取子模块名称 (以路径第一级目录作为子模块名)
             cleaned_location = file_rel_path.replace('\\', '/')
             while cleaned_location.startswith("../"):
                 cleaned_location = cleaned_location[3:]
-                
+
             path_parts = [p for p in cleaned_location.split("/") if p]
             submodule_name = path_parts[0] if path_parts else "UnknownSubmodule"
 
@@ -79,17 +85,21 @@ def process_xml_report_to_csv(xml_file, output_csv_path, prefix_path):
         except Exception as e:
             print(f"❌ 写入 CSV 失败: {e}")
     else:
-        print("未在 XML 报告中提取到任何满足条件的冗余头文件数据。")
+        print("未在 SARIF 报告中提取到任何满足条件的冗余头文件数据。")
+
+def process_xml_report_to_csv(xml_file, output_csv_path, prefix_path):
+    # 为兼容旧调用方保留函数名，实际输入已切换为 SARIF(JSON)
+    process_sarif_report_to_csv(xml_file, output_csv_path, prefix_path)
 
 def main():
-    parser = argparse.ArgumentParser(description="Parse JetBrains InspectCode XML report directly to CSV.")
-    parser.add_argument('-i', '--input', required=True, help="输入的报告文件路径 (XML 格式)")
+    parser = argparse.ArgumentParser(description="Parse JetBrains InspectCode SARIF report directly to CSV.")
+    parser.add_argument('-i', '--input', required=True, help="输入的报告文件路径 (SARIF/JSON 格式)")
     parser.add_argument('-o', '--output', default='output.csv', help="输出的 CSV 文件路径")
     parser.add_argument('-p', '--prefix', required=True, help="本地源码的根目录绝对路径")
     
     args = parser.parse_args()
     
-    process_xml_report_to_csv(args.input, args.output, args.prefix)
+    process_sarif_report_to_csv(args.input, args.output, args.prefix)
 
 if __name__ == "__main__":
     main()
