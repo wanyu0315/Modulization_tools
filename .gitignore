@@ -1,2 +1,4 @@
 cache/
 _pycache__/
+.vscode/
+check_head_tools/Build/__pycache__/
