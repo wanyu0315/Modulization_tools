@@ -115,6 +115,106 @@ def tail_text_file(path, max_chars=4000):
         return ""
 
 
+def sanitize_filename(name):
+    safe = []
+    for ch in name:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    return "".join(safe).strip("_") or "unknown"
+
+
+def summarize_rows(rows, prefix=""):
+    grouped = {}
+    for row in rows or []:
+        if len(row) < 3:
+            continue
+        file_rel_path = row[1]
+        file_display_path = file_rel_path
+        if prefix and not os.path.isabs(file_rel_path):
+            file_display_path = os.path.normpath(os.path.join(prefix, file_rel_path))
+        grouped.setdefault(file_display_path, []).append(str(row[2]))
+
+    summary_lines = []
+    for file_rel_path, line_numbers in grouped.items():
+        ordered_lines = sorted(line_numbers, key=lambda item: int(item) if item.isdigit() else item)
+        summary_lines.append(f"- {file_rel_path} | 行号: {', '.join(ordered_lines)}")
+
+    return "\n".join(summary_lines) if summary_lines else "- 无头文件行信息"
+
+
+def archive_failure_report(
+    failure_log_dir, failure_type, build_info, rows=None, note="", prefix=""
+):
+    """将失败构建的上下文、尾部日志和原始日志统一归档，便于后续排查。"""
+    os.makedirs(failure_log_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    config = build_info.get("config", "unknown").lower()
+    label = sanitize_filename(build_info.get("label", "build"))
+    report_base = f"{timestamp}_{config}_{label}"
+
+    raw_log_source = build_info.get("log_path")
+    raw_log_dest = ""
+    if raw_log_source and os.path.exists(raw_log_source):
+        raw_log_dest = os.path.join(failure_log_dir, f"{report_base}.msbuild.log")
+        try:
+            shutil.move(raw_log_source, raw_log_dest)
+        except Exception:
+            raw_log_dest = raw_log_source
+
+    report_path = os.path.join(failure_log_dir, f"{report_base}.failure.txt")
+    rows_summary = summarize_rows(rows, prefix=prefix)
+    log_tail = build_info.get("log_tail") or "(未捕获到日志尾部内容)"
+    timed_out = "是" if build_info.get("timed_out") else "否"
+
+    if failure_type == "baseline":
+        conclusion = "基线工程本身编译失败，当前轮头文件冗余判定无效，应先修复工程或环境。"
+    elif failure_type == "batch":
+        conclusion = "批量注释后触发构建失败，候选集合中至少有一项核心依赖。"
+    elif failure_type == "single":
+        conclusion = "单行注释后仍触发构建失败，该头文件可视为核心依赖候选。"
+    else:
+        conclusion = "构建失败，请结合日志尾部继续排查。"
+
+    content = [
+        "Fast Build Failure Report",
+        "=" * 72,
+        f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"失败类型: {failure_type}",
+        f"结论摘要: {conclusion}",
+        f"编译模式: {build_info.get('config', 'Unknown')}",
+        f"构建动作: {build_info.get('target', 'Unknown')}",
+        f"构建目标: {build_info.get('target_path', 'Unknown')}",
+        f"目标标签: {build_info.get('label', 'Unknown')}",
+        f"是否超时: {timed_out}",
+        f"构建耗时: {build_info.get('elapsed_text', 'Unknown')}",
+        "",
+        "失败头文件信息:",
+        rows_summary,
+        "",
+        "维护建议:",
+        note or "优先查看失败日志尾部中的首个编译错误，再确认对应头文件是否提供了关键声明、宏或类型依赖。",
+        "",
+        f"原始构建日志: {raw_log_dest or '(原始日志不存在)'}",
+        "",
+        "失败日志尾部:",
+        "-" * 72,
+        log_tail,
+        "-" * 72,
+        "",
+    ]
+
+    with open(report_path, "w", encoding="utf-8-sig") as fout:
+        fout.write("\n".join(content))
+
+    print(f"      失败报告: {report_path}")
+    if raw_log_dest:
+        print(f"      原始日志: {raw_log_dest}")
+    return report_path
+
+
 def default_msbuild_cpu_count():
     """默认使用本机逻辑核数的一半，至少保留 1 个构建节点。"""
     cpu_total = os.cpu_count() or 1
@@ -207,7 +307,16 @@ def run_msbuild(
     global _consecutive_failures
 
     if not os.path.exists(msbuild_path) or not os.path.exists(target_path):
-        return False, False
+        return False, False, {
+            "target_path": target_path,
+            "target": target,
+            "config": config,
+            "label": os.path.basename(target_path),
+            "log_path": None,
+            "log_tail": "",
+            "timed_out": False,
+            "elapsed_text": "0.0s",
+        }
 
     cmd = [
         msbuild_path,
@@ -231,14 +340,23 @@ def run_msbuild(
     print(f"      执行: MSBuild /t:{target} /p:Configuration={config}  [{label}]")
     start_time = time.time()
     proc = None
-    log_path = None
+    build_info = {
+        "target_path": target_path,
+        "target": target,
+        "config": config,
+        "label": label,
+        "log_path": None,
+        "log_tail": "",
+        "timed_out": False,
+        "elapsed_text": "Unknown",
+    }
 
     try:
         with tempfile.NamedTemporaryFile(
             delete=False,
             suffix=f".{target.lower()}.{config.lower()}.log"
         ) as log_file:
-            log_path = log_file.name
+            build_info["log_path"] = log_file.name
             proc = subprocess.Popen(
                 cmd,
                 stdout=log_file,
@@ -253,13 +371,15 @@ def run_msbuild(
             proc.wait()
         kill_vs_processes()
         _consecutive_failures += 1
-        if log_path:
-            tail = tail_text_file(log_path)
+        build_info["timed_out"] = True
+        build_info["elapsed_text"] = f"{timeout:.1f}s (timeout)"
+        if build_info["log_path"]:
+            tail = tail_text_file(build_info["log_path"])
             if tail:
+                build_info["log_tail"] = tail
                 print("      失败日志尾部:")
                 print(tail)
-                print(f"      日志文件: {log_path}")
-        return False, True  # 返回: 构建失败, 触发超时状态
+        return False, True, build_info  # 返回: 构建失败, 触发超时状态
     except KeyboardInterrupt:
         # 新增保护机制：捕获 Ctrl+C 强制中断，确保后台进程被正确清理
         print("\n      警告: 检测到强制中断指令 (Ctrl+C)，正在清理底层编译进程并释放文件锁...")
@@ -275,55 +395,72 @@ def run_msbuild(
             proc.wait()
         kill_vs_processes()
         _consecutive_failures += 1
-        if log_path:
-            tail = tail_text_file(log_path)
+        if build_info["log_path"]:
+            tail = tail_text_file(build_info["log_path"])
             if tail:
+                build_info["log_tail"] = tail
                 print("      失败日志尾部:")
                 print(tail)
-                print(f"      日志文件: {log_path}")
-        return False, False
+        return False, False, build_info
 
     elapsed = time.time() - start_time
+    build_info["elapsed_text"] = f"{elapsed:.1f}s"
     ok = proc.returncode == 0
     mark = "成功" if ok else "失败"
     print(f"      结果: {mark} (耗时: {elapsed:.1f}s)")
     if ok:
         _consecutive_failures = 0
-        if log_path and os.path.exists(log_path):
+        if build_info["log_path"] and os.path.exists(build_info["log_path"]):
             try:
-                os.remove(log_path)
+                os.remove(build_info["log_path"])
             except OSError:
                 pass
+        build_info["log_path"] = None
     else:
         _consecutive_failures += 1
-        tail = tail_text_file(log_path)
+        tail = tail_text_file(build_info["log_path"])
         if tail:
+            build_info["log_tail"] = tail
             print("      失败日志尾部:")
             print(tail)
-        if log_path:
-            print(f"      日志文件: {log_path}")
-    return ok, False  # 返回: 正常完成状态, 未触发超时
+    return ok, False, build_info  # 返回: 正常完成状态, 未触发超时
 
 
-def run_baseline_validation(sln_path, msbuild_path, timeout, max_cpu_count, enable_binlog):
+def run_baseline_validation(
+    sln_path, msbuild_path, timeout, max_cpu_count, enable_binlog, failure_log_dir
+):
     """
     在修改任何源码前先验证基线工程本身能否完成双端 Build。
     若基线已失败，则 fast_build 的后续结论全部无效，应立即中止。
     """
     print("\n[基线验证] 先检查未修改源码时的构建环境是否健康...")
-    debug_ok, _ = run_msbuild(
+    debug_ok, _, debug_info = run_msbuild(
         msbuild_path, sln_path, "Build", "Debug", timeout, max_cpu_count,
         enable_binlog=enable_binlog
     )
     if not debug_ok:
+        archive_failure_report(
+            failure_log_dir,
+            "baseline",
+            debug_info,
+            note="未改任何头文件前工程已在 Debug 基线失败，请先修复工程或编译环境，再执行冗余头文件分析。",
+            prefix="",
+        )
         print("[基线验证] Debug 构建失败。当前环境或工程基线不健康，停止后续冗余头文件判定。")
         return False
 
-    release_ok, _ = run_msbuild(
+    release_ok, _, release_info = run_msbuild(
         msbuild_path, sln_path, "Build", "Release", timeout, max_cpu_count,
         enable_binlog=enable_binlog
     )
     if not release_ok:
+        archive_failure_report(
+            failure_log_dir,
+            "baseline",
+            release_info,
+            note="未改任何头文件前工程已在 Release 基线失败，请先修复工程或编译环境，再执行冗余头文件分析。",
+            prefix="",
+        )
         print("[基线验证] Release 构建失败。当前环境或工程基线不健康，停止后续冗余头文件判定。")
         return False
 
@@ -484,15 +621,16 @@ def process_with_merged_restore(
         # 步骤3：执行批量双端构建验证
         print(f"   状态: 启动批量构建验证 (共 {len(valid_rows)} 行)...")
         
-        batch_debug_ok, batch_debug_timeout = run_msbuild(
+        batch_debug_ok, batch_debug_timeout, batch_debug_info = run_msbuild(
             msbuild_path, build_target, "Build", "Debug", args.timeout_build,
             args.max_cpu_count,
             is_project=bool(vcxproj and args.use_project_opt), enable_binlog=args.enable_binlog
         )
         
         batch_release_ok, batch_release_timeout = False, False
+        batch_release_info = None
         if batch_debug_ok:
-            batch_release_ok, batch_release_timeout = run_msbuild(
+            batch_release_ok, batch_release_timeout, batch_release_info = run_msbuild(
                 msbuild_path, build_target, "Build", "Release", args.timeout_build,
                 args.max_cpu_count,
                 is_project=bool(vcxproj and args.use_project_opt), enable_binlog=args.enable_binlog
@@ -509,21 +647,54 @@ def process_with_merged_restore(
             # 批量测试未通过，恢复源文件状态并执行条件判断
             failed_stage = "Release" if batch_debug_ok else "Debug"
             restore_file(full_path, backup)
+            failed_info = batch_release_info if batch_debug_ok else batch_debug_info
             
             # 优化 1：超时熔断。若失败原因为超时，则放弃单行拆分排查以规避无效耗时
             if batch_debug_timeout or batch_release_timeout:
                 print(f"   失败: 批量验证在 {failed_stage} 阶段触发超时拦截。")
                 print("   策略: 跳过单行排查模式，保留文件原始状态。")
+                archive_failure_report(
+                    args.failure_log_dir,
+                    "batch",
+                    failed_info,
+                    rows=valid_rows,
+                    note=(
+                        f"批量注释集合在 {failed_stage} 下触发超时。请先查看尾部日志中的最后一个正在编译的源文件，"
+                        "再决定是延长超时还是拆分排查。"
+                    ),
+                    prefix=prefix,
+                )
             
             # 优化 2：单行短路评估。若当前文件仅包含 1 行待测代码，直接确认为核心依赖
             elif len(valid_rows) == 1:
                 single_line = int(valid_rows[0][2])
                 print(f"   失败: 唯一验证目标在 {failed_stage} 构建阶段未能通过。")
                 print(f"      结论: 判定第 {single_line} 行为必要依赖，已回滚保护。")
+                archive_failure_report(
+                    args.failure_log_dir,
+                    "single",
+                    failed_info,
+                    rows=valid_rows,
+                    note=(
+                        f"该头文件在 {failed_stage} 模式下移除后直接导致构建失败，可优先视为核心依赖。"
+                    ),
+                    prefix=prefix,
+                )
                 
             else:
                 # 仅在非超时错误且待测行数 > 1 的情况下，转入单行遍历测试
                 print(f"   状态: 批量验证在 {failed_stage} 阶段捕获到构建错误。转入逐行排查模式...")
+                archive_failure_report(
+                    args.failure_log_dir,
+                    "batch",
+                    failed_info,
+                    rows=valid_rows,
+                    note=(
+                        f"批量注释集合在 {failed_stage} 模式下失败，说明这些候选中至少有一项核心依赖。"
+                        "脚本已继续逐行排查，请优先参考该报告中的首个编译错误。"
+                    ),
+                    prefix=prefix,
+                )
                 
                 for single_row in valid_rows:
                     single_line = int(single_row[2])
@@ -534,15 +705,16 @@ def process_with_merged_restore(
                     if not single_result: continue
                     single_backup, _ = single_result
                     
-                    single_debug_ok, _ = run_msbuild(
+                    single_debug_ok, _, single_debug_info = run_msbuild(
                         msbuild_path, build_target, "Build", "Debug", args.timeout_build,
                         args.max_cpu_count,
                         is_project=bool(vcxproj and args.use_project_opt), enable_binlog=args.enable_binlog
                     )
                     
                     single_release_ok = False
+                    single_release_info = None
                     if single_debug_ok:
-                        single_release_ok, _ = run_msbuild(
+                        single_release_ok, _, single_release_info = run_msbuild(
                             msbuild_path, build_target, "Build", "Release", args.timeout_build,
                             args.max_cpu_count,
                             is_project=bool(vcxproj and args.use_project_opt), enable_binlog=args.enable_binlog
@@ -554,6 +726,19 @@ def process_with_merged_restore(
                         print(f"      通过: 第 {single_line} 行为非必要代码，已记录并还原。")
                     else:
                         restore_file(full_path, single_backup)
+                        single_failed_stage = "Release" if single_debug_ok else "Debug"
+                        failed_info = single_release_info if single_debug_ok else single_debug_info
+                        archive_failure_report(
+                            args.failure_log_dir,
+                            "single",
+                            failed_info,
+                            rows=[single_row],
+                            note=(
+                                f"该头文件在 {single_failed_stage} 模式下移除后触发构建失败，可视为核心依赖候选。"
+                                "请结合日志中的首个错误确认它提供的是类型、宏、函数声明还是锁/资源相关依赖。"
+                            ),
+                            prefix=prefix,
+                        )
                         print(f"      失败: 第 {single_line} 行为核心依赖，已回滚。")
 
         # 步骤4：将验证通过的记录持续写入结果文件
@@ -621,6 +806,11 @@ def main():
         action="store_true",
         help="开启 MSBuild 二进制结构化日志功能 (仅限调试排错使用，可能引发高额 I/O 开销)"
     )
+    parser.add_argument(
+        "--failure-log-dir",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "failure_logs"),
+        help="失败报告与原始构建日志的归档目录，默认位于脚本目录下的 failure_logs",
+    )
     args = parser.parse_args()
 
     out_csv = f"build_passed_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
@@ -634,6 +824,7 @@ def main():
     print(f" SLN 路径 : {args.sln}")
     print(f" CSV 文件 : {args.csv}")
     print(f" 输出文件 : {out_csv}")
+    print(f" 失败日志目录 : {args.failure_log_dir}")
     print(f" 目标模块 : {args.module if args.module else '未限制 (全量运行)'}")
     print(f" 最大并发 : {args.max_cpu_count}")
     print(f" 冷却阈值 : 连续失败 {args.max_failures} 次")
@@ -671,13 +862,15 @@ def main():
     install_cleanup_handlers()
     recover_leftover_backups(file_groups, prefix)
     kill_vs_processes()
+    os.makedirs(args.failure_log_dir, exist_ok=True)
 
     print(f"\n统计: 有效读取 {len(all_rows)} 条记录，整合映射为 {len(file_groups)} 个物理文件。\n")
 
     # 进入验证主循环
     try:
         if not run_baseline_validation(
-            args.sln, args.msbuild, args.timeout_build, args.max_cpu_count, args.enable_binlog
+            args.sln, args.msbuild, args.timeout_build, args.max_cpu_count,
+            args.enable_binlog, args.failure_log_dir
         ):
             return
 
