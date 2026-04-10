@@ -4,29 +4,91 @@ import shutil
 import subprocess
 import argparse
 import time
+import signal
+import atexit
+import tempfile
 from datetime import datetime
 from itertools import groupby
+
+
+_active_backups = {}
+_cleanup_in_progress = False
+_consecutive_failures = 0
 
 
 # ----------------------------------------------
 # 进程清理
 # ----------------------------------------------
+def _wait_for_processes_dead(process_names, timeout=15):
+    """轮询 tasklist，尽量确认底层编译进程已经完全退出。"""
+    names_lower = {name.lower() for name in process_names}
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            break
+
+        running = {
+            line.split(",")[0].strip('"').lower()
+            for line in result.stdout.splitlines()
+            if line.strip()
+        }
+        if not (names_lower & running):
+            break
+        time.sleep(0.5)
+
+    time.sleep(2)
+
+
 def kill_vs_processes():
     """强制终止 VS 相关进程（含子进程），并等待文件锁释放。"""
-    # 关键修复 1：确保包含 cl.exe 和 link.exe，彻底清除占用 CPU 和锁定文件的底层进程
+    process_names = [
+        "VBCSCompiler.exe",
+        "mspdbsrv.exe",
+        "MSBuild.exe",
+        "MSBuildTaskHost.exe",
+        "cl.exe",
+        "link.exe",
+        "rc.exe",
+        "csc.exe",
+        "vbc.exe",
+    ]
     try:
-        cmd = [
-            "taskkill", "/F", "/T", 
-            "/IM", "VBCSCompiler.exe", 
-            "/IM", "mspdbsrv.exe", 
-            "/IM", "MSBuild.exe", 
-            "/IM", "cl.exe", 
-            "/IM", "link.exe"
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(2)  # 确保系统文件锁完全释放
+        for name in process_names:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/IM", name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
     except Exception:
         pass
+    _wait_for_processes_dead(process_names, timeout=15)
+
+
+def maybe_cooldown_environment(max_failures):
+    """连续失败过多时做一次重置，避免在异常环境上持续误判。"""
+    global _consecutive_failures
+
+    if _consecutive_failures < max_failures:
+        return
+
+    print(f"\n   警告: 已连续失败 {_consecutive_failures} 次，触发环境冷却保护。")
+    print("   状态: 正在清理残留编译进程并等待系统资源回收 (30s)...")
+    kill_vs_processes()
+    time.sleep(30)
+    _consecutive_failures = 0
+    print("   状态: 冷却完成，继续执行。")
 
 
 def touch_file(path):
@@ -36,10 +98,105 @@ def touch_file(path):
         pass
 
 
+def tail_text_file(path, max_chars=4000):
+    """仅读取日志尾部，避免失败时把整份构建日志灌进控制台。"""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            read_size = min(size, max_chars * 4)
+            if read_size < size:
+                f.seek(-read_size, os.SEEK_END)
+            else:
+                f.seek(0, os.SEEK_SET)
+            data = f.read().decode("utf-8", errors="ignore")
+            return data[-max_chars:]
+    except Exception:
+        return ""
+
+
+def default_msbuild_cpu_count():
+    """默认使用本机逻辑核数的一半，至少保留 1 个构建节点。"""
+    cpu_total = os.cpu_count() or 1
+    return max(1, cpu_total // 2)
+
+
+def register_backup(file_path, backup_path):
+    _active_backups[file_path] = backup_path
+
+
+def unregister_backup(file_path):
+    _active_backups.pop(file_path, None)
+
+
+def cleanup_active_backups():
+    """恢复当前进程登记的所有活动备份，确保异常退出时源码回滚。"""
+    global _cleanup_in_progress
+    if _cleanup_in_progress:
+        return
+    _cleanup_in_progress = True
+    try:
+        for file_path, backup_path in list(_active_backups.items()):
+            if not os.path.exists(backup_path):
+                unregister_backup(file_path)
+                continue
+            try:
+                shutil.copy2(backup_path, file_path)
+                touch_file(file_path)
+                os.remove(backup_path)
+            except Exception as e:
+                print(f"      异常: 自动回滚失败: {file_path} ({e})")
+            finally:
+                unregister_backup(file_path)
+    finally:
+        _cleanup_in_progress = False
+
+
+def handle_termination_signal(signum, _frame):
+    """接收中断/终止信号时，先清理编译进程，再回滚注释。"""
+    print(f"\n检测到终止信号 ({signum})，正在清理编译进程并回滚已注释代码...")
+    kill_vs_processes()
+    cleanup_active_backups()
+    raise SystemExit(128 + signum)
+
+
+def install_cleanup_handlers():
+    atexit.register(cleanup_active_backups)
+    if hasattr(signal, "SIGINT"):
+        signal.signal(signal.SIGINT, handle_termination_signal)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, handle_termination_signal)
+
+
+def recover_leftover_backups(file_groups, prefix):
+    """
+    启动时扫描当前任务涉及的目标文件，若存在上次异常退出遗留的 .bak，则优先恢复。
+    只处理本轮 CSV 涉及的文件，避免误碰无关 .bak 文件。
+    """
+    recovered = 0
+    for file_rel_path in file_groups:
+        file_path = os.path.normpath(os.path.join(prefix, file_rel_path))
+        backup_path = file_path + ".bak"
+        if not os.path.exists(backup_path):
+            continue
+        try:
+            shutil.copy2(backup_path, file_path)
+            touch_file(file_path)
+            os.remove(backup_path)
+            recovered += 1
+        except Exception as e:
+            print(f"警告: 启动恢复遗留备份失败: {file_path} ({e})")
+    if recovered:
+        print(f"恢复: 检测到并已回滚 {recovered} 个上次遗留的 .bak 备份文件。")
+
+
 # ----------------------------------------------
 # 构建执行
 # ----------------------------------------------
-def run_msbuild(msbuild_path, target_path, target, config, timeout, is_project=False, enable_binlog=False):
+def run_msbuild(
+    msbuild_path, target_path, target, config, timeout, max_cpu_count,
+    is_project=False, enable_binlog=False
+):
     """
     执行单次 MSBuild 调用。
     - target_path: .sln 路径，或单一 .vcxproj 路径（子项目优化）
@@ -47,6 +204,8 @@ def run_msbuild(msbuild_path, target_path, target, config, timeout, is_project=F
     - enable_binlog: 是否输出二进制结构化日志
     返回: (success_bool, timeout_bool)
     """
+    global _consecutive_failures
+
     if not os.path.exists(msbuild_path) or not os.path.exists(target_path):
         return False, False
 
@@ -56,7 +215,7 @@ def run_msbuild(msbuild_path, target_path, target, config, timeout, is_project=F
         f"/t:{target}",
         f"/p:Configuration={config}",
         "/p:Platform=x64",
-        "/m",
+        f"/m:{max_cpu_count}",
         "/p:BuildInParallel=true",
         "/p:MultiProcessorCompilation=true",
         "/nologo",
@@ -71,40 +230,105 @@ def run_msbuild(msbuild_path, target_path, target, config, timeout, is_project=F
     label = os.path.basename(target_path)
     print(f"      执行: MSBuild /t:{target} /p:Configuration={config}  [{label}]")
     start_time = time.time()
+    proc = None
+    log_path = None
 
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        proc.wait(timeout=timeout)
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=f".{target.lower()}.{config.lower()}.log"
+        ) as log_file:
+            log_path = log_file.name
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         print(f"      异常: 构建超时 ({timeout}s)")
-        proc.kill()
+        if proc:
+            proc.kill()
+            proc.wait()
         kill_vs_processes()
+        _consecutive_failures += 1
+        if log_path:
+            tail = tail_text_file(log_path)
+            if tail:
+                print("      失败日志尾部:")
+                print(tail)
+                print(f"      日志文件: {log_path}")
         return False, True  # 返回: 构建失败, 触发超时状态
     except KeyboardInterrupt:
         # 新增保护机制：捕获 Ctrl+C 强制中断，确保后台进程被正确清理
         print("\n      警告: 检测到强制中断指令 (Ctrl+C)，正在清理底层编译进程并释放文件锁...")
-        proc.kill()
+        if proc:
+            proc.kill()
+            proc.wait()
         kill_vs_processes()
         raise  # 清理完毕后，继续向上抛出异常以安全终止 Python 主进程
     except Exception as e:
         print(f"      异常: 进程执行期间发生未知错误 ({e})")
-        proc.kill()
+        if proc:
+            proc.kill()
+            proc.wait()
         kill_vs_processes()
-        return False, True
+        _consecutive_failures += 1
+        if log_path:
+            tail = tail_text_file(log_path)
+            if tail:
+                print("      失败日志尾部:")
+                print(tail)
+                print(f"      日志文件: {log_path}")
+        return False, False
 
     elapsed = time.time() - start_time
     ok = proc.returncode == 0
     mark = "成功" if ok else "失败"
     print(f"      结果: {mark} (耗时: {elapsed:.1f}s)")
+    if ok:
+        _consecutive_failures = 0
+        if log_path and os.path.exists(log_path):
+            try:
+                os.remove(log_path)
+            except OSError:
+                pass
+    else:
+        _consecutive_failures += 1
+        tail = tail_text_file(log_path)
+        if tail:
+            print("      失败日志尾部:")
+            print(tail)
+        if log_path:
+            print(f"      日志文件: {log_path}")
     return ok, False  # 返回: 正常完成状态, 未触发超时
+
+
+def run_baseline_validation(sln_path, msbuild_path, timeout, max_cpu_count, enable_binlog):
+    """
+    在修改任何源码前先验证基线工程本身能否完成双端 Build。
+    若基线已失败，则 fast_build 的后续结论全部无效，应立即中止。
+    """
+    print("\n[基线验证] 先检查未修改源码时的构建环境是否健康...")
+    debug_ok, _ = run_msbuild(
+        msbuild_path, sln_path, "Build", "Debug", timeout, max_cpu_count,
+        enable_binlog=enable_binlog
+    )
+    if not debug_ok:
+        print("[基线验证] Debug 构建失败。当前环境或工程基线不健康，停止后续冗余头文件判定。")
+        return False
+
+    release_ok, _ = run_msbuild(
+        msbuild_path, sln_path, "Build", "Release", timeout, max_cpu_count,
+        enable_binlog=enable_binlog
+    )
+    if not release_ok:
+        print("[基线验证] Release 构建失败。当前环境或工程基线不健康，停止后续冗余头文件判定。")
+        return False
+
+    print("[基线验证] Debug/Release 均通过，开始逐文件验证。")
+    return True
 
 
 # ----------------------------------------------
@@ -134,6 +358,7 @@ def comment_lines(file_path, line_numbers):
                 lines[ln - 1] = f"// {raw}\n"
 
         shutil.copy2(file_path, backup)
+        register_backup(file_path, backup)
         with open(file_path, "w", encoding="utf-8", errors="ignore") as f:
             f.writelines(lines)
         touch_file(file_path)
@@ -153,6 +378,7 @@ def restore_file(file_path, backup):
         shutil.copy2(backup, file_path)
         touch_file(file_path)
         os.remove(backup)
+        unregister_backup(file_path)
     except Exception as e:
         print(f"      异常: 文件还原操作失败: {e}")
 
@@ -222,6 +448,13 @@ def process_with_merged_restore(
         print(f"进度: [{idx+1}/{len(file_list)}] 文件: {file_path}")
         print(f"   待测行号: {line_numbers}")
 
+        if idx > 0 and idx % 20 == 0:
+            print(f"\n   状态: 已处理 {idx} 个文件，执行预防性进程清理...")
+            kill_vs_processes()
+            time.sleep(3)
+
+        maybe_cooldown_environment(args.max_failures)
+
         if not os.path.exists(full_path):
             print("   警告: 目标文件不存在，跳过当前项")
             continue
@@ -252,14 +485,16 @@ def process_with_merged_restore(
         print(f"   状态: 启动批量构建验证 (共 {len(valid_rows)} 行)...")
         
         batch_debug_ok, batch_debug_timeout = run_msbuild(
-            msbuild_path, build_target, "Build", "Debug", args.timeout_build, 
+            msbuild_path, build_target, "Build", "Debug", args.timeout_build,
+            args.max_cpu_count,
             is_project=bool(vcxproj and args.use_project_opt), enable_binlog=args.enable_binlog
         )
         
         batch_release_ok, batch_release_timeout = False, False
         if batch_debug_ok:
             batch_release_ok, batch_release_timeout = run_msbuild(
-                msbuild_path, build_target, "Build", "Release", args.timeout_build, 
+                msbuild_path, build_target, "Build", "Release", args.timeout_build,
+                args.max_cpu_count,
                 is_project=bool(vcxproj and args.use_project_opt), enable_binlog=args.enable_binlog
             )
 
@@ -267,7 +502,7 @@ def process_with_merged_restore(
         if batch_debug_ok and batch_release_ok:
             # 批量测试在 Debug 与 Release 环境下均通过
             passed_rows = valid_rows
-			restore_file(full_path, backup)
+            restore_file(full_path, backup)
             print(f"   通过: 批量双端验证完成。{len(passed_rows)} 行代码已确认冗余。记录已保存，代码已自动还原。")
             
         else:
@@ -293,26 +528,29 @@ def process_with_merged_restore(
                 for single_row in valid_rows:
                     single_line = int(single_row[2])
                     print(f"\n      执行: 独立排查第 {single_line} 行...")
+                    maybe_cooldown_environment(args.max_failures)
                     
                     single_result = comment_lines(full_path, [single_line])
                     if not single_result: continue
                     single_backup, _ = single_result
                     
                     single_debug_ok, _ = run_msbuild(
-                        msbuild_path, build_target, "Build", "Debug", args.timeout_build, 
+                        msbuild_path, build_target, "Build", "Debug", args.timeout_build,
+                        args.max_cpu_count,
                         is_project=bool(vcxproj and args.use_project_opt), enable_binlog=args.enable_binlog
                     )
                     
                     single_release_ok = False
                     if single_debug_ok:
                         single_release_ok, _ = run_msbuild(
-                            msbuild_path, build_target, "Build", "Release", args.timeout_build, 
+                            msbuild_path, build_target, "Build", "Release", args.timeout_build,
+                            args.max_cpu_count,
                             is_project=bool(vcxproj and args.use_project_opt), enable_binlog=args.enable_binlog
                         )
                     
                     if single_debug_ok and single_release_ok:
                         passed_rows.append(single_row)
-						restore_file(full_path, single_backup)
+                        restore_file(full_path, single_backup)
                         print(f"      通过: 第 {single_line} 行为非必要代码，已记录并还原。")
                     else:
                         restore_file(full_path, single_backup)
@@ -330,6 +568,16 @@ def process_with_merged_restore(
 # ----------------------------------------------
 # 命令行参数解析与入口
 # ----------------------------------------------
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("必须为正整数") from e
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("必须为正整数")
+    return parsed
+
+
 def main():
     global_start = time.time()
 
@@ -341,6 +589,18 @@ def main():
         default=r"C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe",
     )
     parser.add_argument("--timeout-build", type=int, default=600, help="单次构建超时时长限制（秒）")
+    parser.add_argument(
+        "--max-cpu-count",
+        type=int,
+        default=default_msbuild_cpu_count(),
+        help="MSBuild 编译最大并行度，默认使用本机逻辑核数的一半",
+    )
+    parser.add_argument(
+        "--max-failures",
+        type=positive_int,
+        default=3,
+        help="连续构建失败达到该阈值后，执行一次环境冷却保护",
+    )
     
     # 关键修复 3：保留并说明支持多模块联合过滤的参数特性
     parser.add_argument("--module", default="", help="过滤指定子模块，支持逗号分隔多个模块 (如: cad,geometry)，留空则验证所有记录")
@@ -366,8 +626,8 @@ def main():
     out_csv = f"build_passed_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
 
     # 基于解决方案路径提取项目根目录前缀
-    out_index = args.sln.find("out")
-    prefix = args.sln[:out_index] if out_index != -1 else os.path.dirname(args.sln)
+    out_index = args.sln.rfind(os.sep + "out" + os.sep)
+    prefix = args.sln[:out_index + 1] if out_index != -1 else os.path.dirname(args.sln)
 
     print("=" * 60)
     print(" 工具: Fast Build 增量测试工具 v2")
@@ -375,13 +635,15 @@ def main():
     print(f" CSV 文件 : {args.csv}")
     print(f" 输出文件 : {out_csv}")
     print(f" 目标模块 : {args.module if args.module else '未限制 (全量运行)'}")
+    print(f" 最大并发 : {args.max_cpu_count}")
+    print(f" 冷却阈值 : 连续失败 {args.max_failures} 次")
     print(f" 项目优化 : {'已启用' if args.use_project_opt else '未启用'}")
     print(f" 日志调试 : {'已启用 (警告: I/O 密集)' if args.enable_binlog else '未启用'}")
     print("=" * 60)
 
     # 读取并初始化过滤目标记录
     all_rows = []
-    with open(args.csv, "r", encoding="utf-8") as fin:
+    with open(args.csv, "r", encoding="utf-8-sig") as fin:
         reader = csv.reader(fin)
         headers = next(reader)
         for row in reader:
@@ -406,16 +668,29 @@ def main():
         fp = row[1]
         file_groups.setdefault(fp, []).append(row)
 
+    install_cleanup_handlers()
+    recover_leftover_backups(file_groups, prefix)
+    kill_vs_processes()
+
     print(f"\n统计: 有效读取 {len(all_rows)} 条记录，整合映射为 {len(file_groups)} 个物理文件。\n")
 
     # 进入验证主循环
-    with open(out_csv, "w", newline="", encoding="utf-8-sig") as fout:
-        writer = csv.writer(fout)
-        writer.writerow(headers)
+    try:
+        if not run_baseline_validation(
+            args.sln, args.msbuild, args.timeout_build, args.max_cpu_count, args.enable_binlog
+        ):
+            return
 
-        pass_count, total_processed = process_with_merged_restore(
-            file_groups, args.sln, args.msbuild, args, prefix, writer, fout
-        )
+        with open(out_csv, "w", newline="", encoding="utf-8-sig") as fout:
+            writer = csv.writer(fout)
+            writer.writerow(headers)
+
+            pass_count, total_processed = process_with_merged_restore(
+                file_groups, args.sln, args.msbuild, args, prefix, writer, fout
+            )
+    finally:
+        kill_vs_processes()
+        cleanup_active_backups()
 
     # 计算与格式化总执行耗时
     elapsed = time.time() - global_start
